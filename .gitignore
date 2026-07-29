@@ -1,0 +1,20 @@
+# Build output
+/build/
+/build-debug/
+
+# Logs
+*.log
+
+# CMake user files
+CMakeUserPresets.json
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln
+*.vcxproj*
+
+# Claude Code session artifacts
+.claude/
