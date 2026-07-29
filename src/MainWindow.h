@@ -17,6 +17,7 @@
 
 class FindReplaceDialog;
 class RuleCheckDialog;
+class SubtitleTableView;
 
 // Delegate that trims whitespace on commit and supports multiline for Source/Target
 class SubtitleDelegate : public QStyledItemDelegate {
@@ -120,13 +121,11 @@ private:
     void tryLoadAudioForTab(FileTab* tab);
     void loadAudioFile(const QString& audioPath);
     void updateTimeIndicator();
-    void openPersistentEditors(int firstRow, int lastRow);
-    void reopenAllPersistentEditors();
     bool handleMouseAction(Qt::MouseButton btn);
 
     // Widgets
     QListWidget* m_fileList;
-    QTableView* m_tableView;
+    SubtitleTableView* m_tableView;
     WaveformWidget* m_waveform;
     QLabel* m_timeIndicator;
     QLabel* m_deltaIndicator;

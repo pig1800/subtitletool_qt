@@ -30,6 +30,9 @@
 #include <QJsonObject>
 #include <QPainter>
 #include <QTextBlock>
+#include <QTextDocument>
+#include <QFontMetrics>
+#include <QSet>
 #include <QFile>
 #include <QFileInfo>
 #include <QDir>
@@ -190,6 +193,119 @@ static void setupEditor(QWidget* editor) {
     }
 }
 
+// ── Table view: viewport-scoped persistent editors ────────────────
+// Instead of mounting a persistent editor for every row in the editable
+// columns (3N widgets, the source of the load/switch freeze), mount them only
+// for the rows currently visible in the viewport and swap them as the user
+// scrolls. Cost is O(visible rows) — a few dozen widgets — while preserving
+// the "every editable cell is a live text field" UX: click places the cursor
+// and drag-selects natively, because the editor widget covers the cell.
+
+class SubtitleTableView : public QTableView {
+public:
+    using QTableView::QTableView;
+
+    // Reconcile mounted editors with the currently visible row range.
+    void refreshVisibleEditors() {
+        auto* m = model();
+        if (!m) { closeAllEditors(); return; }
+
+        // Determine first/last visible row from viewport geometry.
+        int first = -1, last = -1;
+        const int viewH = viewport()->height();
+        const int rowCount = m->rowCount();
+        for (int r = 0; r < rowCount; ++r) {
+            int y = rowViewportPosition(r);
+            int rh = rowHeight(r);
+            if (y + rh <= 0) continue;       // above the viewport
+            if (y >= viewH) break;           // below the viewport
+            if (first < 0) first = r;
+            last = r;
+        }
+
+        QSet<int> desired;
+        if (first >= 0)
+            for (int r = first; r <= last; ++r) desired.insert(r);
+
+        // Close editors for rows that scrolled out of view.
+        for (int r : m_openRows)
+            if (!desired.contains(r)) closeRowEditors(r);
+        // Open editors for newly visible rows.
+        for (int r : desired)
+            if (!m_openRows.contains(r)) openRowEditors(r);
+
+        m_openRows = desired;
+    }
+
+    void setModel(QAbstractItemModel* m) override {
+        // Drop editors for the outgoing model before swapping.
+        if (auto* old = model()) {
+            disconnect(old, nullptr, this, nullptr);
+            closeAllEditors();
+        }
+        QTableView::setModel(m);
+        if (m) {
+            // Structural changes invalidate the open-row set; rebuild.
+            connect(m, &QAbstractItemModel::rowsInserted, this, [this]() {
+                m_openRows.clear(); refreshVisibleEditors();
+            });
+            connect(m, &QAbstractItemModel::rowsRemoved, this, [this]() {
+                m_openRows.clear(); refreshVisibleEditors();
+            });
+            connect(m, &QAbstractItemModel::modelReset, this, [this]() {
+                m_openRows.clear(); refreshVisibleEditors();
+            });
+        }
+        m_needsFirstPaintRefresh = true;
+        refreshVisibleEditors();
+    }
+
+protected:
+    void scrollContentsBy(int dx, int dy) override {
+        QTableView::scrollContentsBy(dx, dy);
+        refreshVisibleEditors();
+    }
+    void resizeEvent(QResizeEvent* e) override {
+        QTableView::resizeEvent(e);
+        refreshVisibleEditors();
+    }
+    void paintEvent(QPaintEvent* e) override {
+        QTableView::paintEvent(e);
+        // Backstop: on the first paint after a model swap the geometry is
+        // finally settled, so remount to cover the full visible range. This
+        // catches cases where the deferred refresh in setActiveFile ran before
+        // the Stretch/ResizeToContents layout completed.
+        if (m_needsFirstPaintRefresh) {
+            m_needsFirstPaintRefresh = false;
+            refreshVisibleEditors();
+        }
+    }
+
+private:
+    QSet<int> m_openRows;
+    bool m_needsFirstPaintRefresh = false;
+
+    static constexpr int kEditableCols[] = { ColSpeaker, ColSource, ColTarget };
+
+    void openRowEditors(int r) {
+        auto* m = model();
+        if (!m) return;
+        for (int c : kEditableCols)
+            if (m->flags(m->index(r, c)) & Qt::ItemIsEditable)
+                openPersistentEditor(m->index(r, c));
+    }
+    void closeRowEditors(int r) {
+        auto* m = model();
+        if (!m) return;
+        for (int c : kEditableCols)
+            closePersistentEditor(m->index(r, c));
+    }
+    void closeAllEditors() {
+        for (int r : m_openRows) closeRowEditors(r);
+        m_openRows.clear();
+    }
+};
+
 // ── Delegate: trim on commit, multiline for Source/Target ────────
 
 QWidget* SubtitleDelegate::createEditor(QWidget* parent, const QStyleOptionViewItem& option,
@@ -310,11 +426,13 @@ void SubtitleDelegate::paint(QPainter* painter, const QStyleOptionViewItem& opti
                              const QModelIndex& index) const
 {
     int col = index.column();
-    // Columns with persistent editors: paint only background, no text
-    // (the editor widget renders the text; painting it here causes double-render)
+    // Editable columns are covered by a viewport-scoped persistent editor that
+    // renders the text (and the Target MaxLen indicator). Paint only the
+    // background here so the row highlight shows through the transparent editor.
     if (col == ColSpeaker || col == ColSource || col == ColTarget) {
         QVariant bg = index.data(Qt::BackgroundRole);
-        painter->fillRect(option.rect, bg.isValid() ? bg.value<QColor>() : option.palette.base().color());
+        painter->fillRect(option.rect, bg.isValid() ? bg.value<QColor>()
+                                                     : option.palette.base().color());
         return;
     }
     QStyledItemDelegate::paint(painter, option, index);
@@ -447,7 +565,7 @@ void MainWindow::setupUI()
     // Mouse button shortcuts are handled globally via eventFilter
 
     // Table view
-    m_tableView = new QTableView;
+    m_tableView = new SubtitleTableView;
     m_tableView->setSelectionMode(QAbstractItemView::SingleSelection);
     m_tableView->setSelectionBehavior(QAbstractItemView::SelectItems);
     m_tableView->verticalHeader()->setVisible(false);
@@ -466,9 +584,12 @@ void MainWindow::setupUI()
     // because word-wrapping may have changed the number of visual lines.
     connect(m_tableView->horizontalHeader(), &QHeaderView::sectionResized,
             this, [this](int logicalIndex, int, int) {
-        if ((logicalIndex == ColSource || logicalIndex == ColTarget) && m_activeFile && m_activeFile->model)
+        if ((logicalIndex == ColSource || logicalIndex == ColTarget) && m_activeFile && m_activeFile->model) {
             for (int r = 0; r < m_activeFile->model->rowCount(); ++r)
                 m_tableView->resizeRowToContents(r);
+            // Row heights changed → visible range may have shifted.
+            m_tableView->refreshVisibleEditors();
+        }
     });
 
     // Toolbar
@@ -867,8 +988,16 @@ void MainWindow::setActiveFile(FileTab* tab)
 
         m_waveform->setSubtitleRows(&tab->model->rows());
 
-        // Open persistent editors for editable columns
-        reopenAllPersistentEditors();
+        // Mount persistent editors for the visible rows only (viewport-scoped;
+        // see SubtitleTableView). The view's geometry isn't settled yet at this
+        // point (Stretch header sections + ResizeToContents row heights are
+        // still pending layout), so a synchronous scan here would under-count
+        // the visible rows and leave the lower half of the viewport blank.
+        // Defer to the next event-loop tick, after Qt processes the pending
+        // layout; the view also backstops this from its first paint.
+        QTimer::singleShot(0, this, [this]() {
+            if (m_tableView) m_tableView->refreshVisibleEditors();
+        });
 
         // Track current cell changes (works even when clicking persistent editors)
         connect(m_tableView->selectionModel(), &QItemSelectionModel::currentChanged,
@@ -877,25 +1006,13 @@ void MainWindow::setActiveFile(FileTab* tab)
         });
 
         // Disconnect any prior connections from this model to us
-        disconnect(tab->model, &QAbstractItemModel::rowsInserted, this, nullptr);
-        disconnect(tab->model, &QAbstractItemModel::modelReset, this, nullptr);
-
-        // Reopen persistent editors when rows are inserted
-        connect(tab->model, &QAbstractItemModel::rowsInserted, this,
-            [this](const QModelIndex&, int first, int last) {
-                openPersistentEditors(first, last);
-            });
-
-        // Reopen all persistent editors after model reset (e.g. undo)
-        connect(tab->model, &QAbstractItemModel::modelReset, this,
-            &MainWindow::reopenAllPersistentEditors);
+        disconnect(tab->model, &QAbstractItemModel::dataChanged, this, nullptr);
 
         // Select first cell
         if (tab->model->rowCount() > 0)
             focusCell(0, ColStart);
 
         // Connect model changes to dirty tracking
-        disconnect(tab->model, &QAbstractItemModel::dataChanged, this, nullptr);
         connect(tab->model, &QAbstractItemModel::dataChanged, this,
             [this, tab](const QModelIndex& topLeft, const QModelIndex& bottomRight, const QList<int>& roles) {
             // Don't mark dirty for display-only changes (highlight row, etc.)
@@ -909,6 +1026,7 @@ void MainWindow::setActiveFile(FileTab* tab)
             // Row heights may need updating when multiline source/target text changes
             for (int r = topLeft.row(); r <= bottomRight.row(); ++r)
                 m_tableView->resizeRowToContents(r);
+            m_tableView->refreshVisibleEditors();
         });
 
         tryLoadAudioForTab(tab);
@@ -1019,24 +1137,6 @@ void MainWindow::updateTitle()
         setWindowTitle("Subtitle Editor");
 }
 
-void MainWindow::openPersistentEditors(int firstRow, int lastRow)
-{
-    if (!m_activeFile || !m_activeFile->model) return;
-    static const int cols[] = { ColSpeaker, ColSource, ColTarget };
-    for (int r = firstRow; r <= lastRow; ++r) {
-        for (int c : cols)
-            m_tableView->openPersistentEditor(m_activeFile->model->index(r, c));
-    }
-}
-
-void MainWindow::reopenAllPersistentEditors()
-{
-    if (!m_activeFile || !m_activeFile->model) return;
-    int rows = m_activeFile->model->rowCount();
-    if (rows > 0)
-        openPersistentEditors(0, rows - 1);
-}
-
 void MainWindow::focusCell(int row, int col)
 {
     if (!m_activeFile || !m_activeFile->model) return;
@@ -1045,6 +1145,10 @@ void MainWindow::focusCell(int row, int col)
     auto idx = m_activeFile->model->index(row, col);
     m_tableView->setCurrentIndex(idx);
     m_tableView->scrollTo(idx);
+
+    // Scrolling may have changed the visible row range; remount editors so the
+    // target row's editor exists before we focus it.
+    m_tableView->refreshVisibleEditors();
 
     // Ensure highlight row is in sync and editor has keyboard focus
     m_activeFile->model->setHighlightRow(row);
@@ -2762,13 +2866,18 @@ void MainWindow::keyPressEvent(QKeyEvent* e)
     if ((isBracketLeft || key == Qt::Key_Left) && alt && shift) { extendStartToCPS(); return; }
     if ((isBracketRight || key == Qt::Key_Right) && alt && shift) { extendEndToCPS(); return; }
 
-    // Navigation (Ctrl+Up/Down → move to Source column, matching WPF col 7)
+    // Navigation (Ctrl+Up/Down → move up/down a row, keeping the current
+    // editable column; fall back to Source if the current column isn't editable).
     if ((key == Qt::Key_Up || key == Qt::Key_Down) && !shift) {
         auto idx = m_tableView->currentIndex();
         if (idx.isValid()) {
             int newRow = (key == Qt::Key_Up) ? idx.row() - 1 : idx.row() + 1;
-            if (newRow >= 0 && newRow < m_activeFile->model->rowCount())
-                focusCell(newRow, ColSource);
+            if (newRow >= 0 && newRow < m_activeFile->model->rowCount()) {
+                int col = idx.column();
+                bool editable = m_activeFile->model->flags(
+                    m_activeFile->model->index(newRow, col)) & Qt::ItemIsEditable;
+                focusCell(newRow, editable ? col : ColSource);
+            }
         }
         return;
     }
