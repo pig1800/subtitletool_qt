@@ -1,5 +1,6 @@
 #include "RuleCheckDialog.h"
 #include "MainWindow.h"
+#include <algorithm>
 
 RuleCheckDialog::RuleCheckDialog(MainWindow* parent, const std::vector<RuleViolation>& violations)
     : QDialog(parent, Qt::Tool)
@@ -24,6 +25,28 @@ void RuleCheckDialog::updateViolations(const std::vector<RuleViolation>& violati
     m_list->clear();
     for (const auto& v : m_violations)
         m_list->addItem(v.displayText);
+}
+
+bool RuleCheckDialog::removeFile(FileTab* file)
+{
+    size_t before = m_violations.size();
+    m_violations.erase(
+        std::remove_if(m_violations.begin(), m_violations.end(),
+                       [file](const RuleViolation& v) { return v.file == file; }),
+        m_violations.end());
+    if (m_violations.size() == before)
+        return false;
+
+    // Preserve the current selection if its entry still exists, else clear.
+    int cur = m_list->currentRow();
+    m_list->clear();
+    for (const auto& v : m_violations)
+        m_list->addItem(v.displayText);
+    if (cur >= 0 && cur < static_cast<int>(m_violations.size()))
+        m_list->setCurrentRow(cur);
+    else
+        m_list->setCurrentRow(-1);
+    return true;
 }
 
 void RuleCheckDialog::onSelectionChanged(int row)

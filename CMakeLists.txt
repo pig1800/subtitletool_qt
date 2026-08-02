@@ -16,6 +16,8 @@ add_executable(subtitletool WIN32
     src/main.cpp
     src/MainWindow.h
     src/MainWindow.cpp
+    src/CrashHandler.h
+    src/CrashHandler.cpp
     src/models/SubtitleRow.h
     src/models/SubtitleRow.cpp
     src/models/SubtitleModel.h
@@ -47,6 +49,15 @@ if(MSVC)
     target_compile_options(subtitletool PRIVATE /arch:AVX2)
 else()
     target_compile_options(subtitletool PRIVATE -mavx2 -mfma)
+endif()
+
+# TEMP (crash investigation): produce a PDB so the crash handler's stack trace
+# resolves to function names + source lines, and the minidump is analyzable.
+# /Zi only (no /Od) so optimizations/timing match the Release build the user
+# runs, keeping the intermittent crash reproducible.
+if(MSVC)
+    target_compile_options(subtitletool PRIVATE /Zi)
+    target_link_options(subtitletool PRIVATE /DEBUG)
 endif()
 
 target_link_libraries(subtitletool PRIVATE

@@ -21,6 +21,10 @@ class RuleCheckDialog : public QDialog {
 public:
     explicit RuleCheckDialog(MainWindow* parent, const std::vector<RuleViolation>& violations);
     void updateViolations(const std::vector<RuleViolation>& violations);
+    // Drop violations whose FileTab* is the one being closed. Returns true if
+    // any were removed (so the caller can hide the dialog when it empties).
+    bool removeFile(FileTab* file);
+    bool isEmpty() const { return m_violations.empty(); }
 
 protected:
     void keyPressEvent(QKeyEvent* e) override {

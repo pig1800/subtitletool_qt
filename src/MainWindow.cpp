@@ -207,8 +207,20 @@ public:
 
     // Reconcile mounted editors with the currently visible row range.
     void refreshVisibleEditors() {
+        // Re-entrancy guard: openPersistentEditor/closePersistentEditor and the
+        // model setData() they trigger can emit signals (dataChanged, focus,
+        // rowsInserted/Removed via the lambdas below) that re-enter this
+        // function. Iterating m_openRows while it's being mutated by a
+        // re-entrant call freed the set's hash nodes mid-iteration and crashed
+        // (read of 0x40). Defer the re-entrant request and run it once after.
+        if (m_inRefresh) {
+            m_refreshPending = true;
+            return;
+        }
+        m_inRefresh = true;
+
         auto* m = model();
-        if (!m) { closeAllEditors(); return; }
+        if (!m) { closeAllEditors(); m_inRefresh = false; return; }
 
         // Determine first/last visible row from viewport geometry.
         int first = -1, last = -1;
@@ -227,14 +239,22 @@ public:
         if (first >= 0)
             for (int r = first; r <= last; ++r) desired.insert(r);
 
-        // Close editors for rows that scrolled out of view.
-        for (int r : m_openRows)
+        // Iterate a STABLE snapshot: a re-entrant signal handler (e.g.
+        // rowsInserted clearing m_openRows) must not invalidate the range-for.
+        QList<int> openSnapshot = m_openRows.values();
+        for (int r : openSnapshot)
             if (!desired.contains(r)) closeRowEditors(r);
         // Open editors for newly visible rows.
         for (int r : desired)
             if (!m_openRows.contains(r)) openRowEditors(r);
 
         m_openRows = desired;
+
+        m_inRefresh = false;
+        if (m_refreshPending) {
+            m_refreshPending = false;
+            refreshVisibleEditors();
+        }
     }
 
     void setModel(QAbstractItemModel* m) override {
@@ -245,15 +265,18 @@ public:
         }
         QTableView::setModel(m);
         if (m) {
-            // Structural changes invalidate the open-row set; rebuild.
+            // Structural changes invalidate the open-row set. Close ALL editors
+            // authoritatively (see closeAllEditors) and rebuild for the visible
+            // range. Do NOT just clear m_openRows — that loses tracking of
+            // scrolled-off editors and leaks them, causing double-drawn text.
             connect(m, &QAbstractItemModel::rowsInserted, this, [this]() {
-                m_openRows.clear(); refreshVisibleEditors();
+                closeAllEditors(); refreshVisibleEditors();
             });
             connect(m, &QAbstractItemModel::rowsRemoved, this, [this]() {
-                m_openRows.clear(); refreshVisibleEditors();
+                closeAllEditors(); refreshVisibleEditors();
             });
             connect(m, &QAbstractItemModel::modelReset, this, [this]() {
-                m_openRows.clear(); refreshVisibleEditors();
+                closeAllEditors(); refreshVisibleEditors();
             });
         }
         m_needsFirstPaintRefresh = true;
@@ -284,6 +307,8 @@ protected:
 private:
     QSet<int> m_openRows;
     bool m_needsFirstPaintRefresh = false;
+    bool m_inRefresh = false;
+    bool m_refreshPending = false;
 
     static constexpr int kEditableCols[] = { ColSpeaker, ColSource, ColTarget };
 
@@ -301,7 +326,29 @@ private:
             closePersistentEditor(m->index(r, c));
     }
     void closeAllEditors() {
-        for (int r : m_openRows) closeRowEditors(r);
+        // AUTHORITATIVE: close every mounted editor by scanning all model
+        // rows via indexWidget, not just the rows tracked in m_openRows.
+        // m_openRows can drift out of sync with actually-mounted editors:
+        // after a structural change (rowsInserted/Removed) the row numbers in
+        // m_openRows no longer match the editors (QPersistentModelIndex auto-
+        // shifted them to new rows), and any editor that was mounted but
+        // scrolled out of view can be dropped from m_openRows without being
+        // closed. Such an untracked editor leaks across setModel (which only
+        // closed m_openRows entries) and, when its row scrolls back into view,
+        // refreshVisibleEditors opens a SECOND editor on top of it → the
+        // double-drawn/misaligned text bug. Scanning indexWidget guarantees
+        // nothing survives.
+        auto* m = model();
+        if (m) {
+            const int rowCount = m->rowCount();
+            for (int r = 0; r < rowCount; ++r) {
+                for (int c : kEditableCols) {
+                    QModelIndex idx = m->index(r, c);
+                    if (indexWidget(idx))
+                        closePersistentEditor(idx);
+                }
+            }
+        }
         m_openRows.clear();
     }
 };
@@ -559,6 +606,21 @@ void MainWindow::setupUI()
     });
 
     centerLayout->addWidget(m_waveform);
+
+    // The indicators are placed against m_waveform->width(), but at construction
+    // the waveform still has its default size — the real width only arrives
+    // after the window is shown and laid out. Without this, on a fresh boot the
+    // timestamp overlay sits in the middle of the audio area until a file is
+    // opened (which triggers a reposition via cursorChanged/updateTimeIndicator).
+    // Reposition once the layout settles.
+    QTimer::singleShot(0, this, [this]() {
+        if (!m_waveform) return;
+        m_timeIndicator->adjustSize();
+        m_timeIndicator->move(m_waveform->width() - m_timeIndicator->width() - 4, 4);
+        m_deltaIndicator->adjustSize();
+        m_deltaIndicator->move(m_waveform->width() - m_deltaIndicator->width() - 4,
+                               4 + m_timeIndicator->height() + 1);
+    });
 
     connect(m_waveform, &WaveformWidget::cursorChanged, this, &MainWindow::onWaveformCursorChanged);
     connect(m_waveform, &WaveformWidget::audioFileDropped, this, &MainWindow::loadAudioFile);
@@ -931,6 +993,15 @@ void MainWindow::closeFile()
     }
     if (idx < 0) return;
 
+    // Drop rule-check entries pointing at the file we're about to free, so the
+    // dialog never holds a dangling FileTab*. Hide it if it empties.
+    FileTab* closing = m_activeFile;
+    if (m_ruleCheckDialog && m_ruleCheckDialog->isVisible()) {
+        m_ruleCheckDialog->removeFile(closing);
+        if (m_ruleCheckDialog->isEmpty())
+            m_ruleCheckDialog->hide();
+    }
+
     m_files.erase(m_files.begin() + idx);
     refreshFileList();
 
@@ -1034,6 +1105,9 @@ void MainWindow::setActiveFile(FileTab* tab)
         m_tableView->setModel(nullptr);
         m_waveform->setAudioData(nullptr);
         m_waveform->setSubtitleRows(nullptr);
+        // No file open: drop any stale audio source so right-click can't
+        // replay audio from a previously closed file.
+        m_player->setSource(QUrl());
     }
 
     // Update file list selection
@@ -1081,7 +1155,11 @@ void MainWindow::tryLoadAudioForTab(FileTab* tab)
             }
         }
     }
+    // No audio for this tab: clear the waveform AND the player source, so a
+    // stale source from a previously-opened audio file can't be replayed via
+    // right-click (playSelection gates on m_player->source().isValid()).
     m_waveform->setAudioData(nullptr);
+    m_player->setSource(QUrl());
 }
 
 void MainWindow::loadAudioFile(const QString& audioPath)
@@ -1169,6 +1247,15 @@ void MainWindow::focusCell(int row, int col)
 
 void MainWindow::focusFileAndCell(FileTab* file, int rowIndex, const QString& columnHeader)
 {
+    // Guard against a dangling FileTab*: the rule-check dialog caches raw
+    // FileTab pointers in its violation list, and closing a file frees the
+    // FileTab while the dialog still lists its violations. Ignore stale
+    // entries instead of dereferencing a freed pointer.
+    bool live = false;
+    for (auto& f : m_files)
+        if (f.get() == file) { live = true; break; }
+    if (!live) return;
+
     if (m_activeFile != file)
         setActiveFile(file);
 
@@ -2441,14 +2528,15 @@ void MainWindow::ruleCheck()
         auto& rows = file->model->rows();
         for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
             auto& row = rows[i];
+            const QString label = file->displayName() + " - Row " + QString::number(i + 1);
             if (row.isDurationWarning())
-                violations.push_back({file.get(), i, "Duration", file->displayName() + " - Duration"});
+                violations.push_back({file.get(), i, "Duration", label + " - Duration"});
             if (row.gapWarning)
-                violations.push_back({file.get(), i, "Gap", file->displayName() + " - Gap"});
+                violations.push_back({file.get(), i, "Gap", label + " - Gap"});
             if (row.isCPSWarning())
-                violations.push_back({file.get(), i, "CPS", file->displayName() + " - CPS"});
+                violations.push_back({file.get(), i, "CPS", label + " - CPS"});
             if (row.isMaxLineLenWarning())
-                violations.push_back({file.get(), i, "MaxLen", file->displayName() + " - MaxLen"});
+                violations.push_back({file.get(), i, "MaxLen", label + " - MaxLen"});
         }
     }
 

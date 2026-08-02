@@ -2,9 +2,11 @@
 #include <QFont>
 #include <QPalette>
 #include "MainWindow.h"
+#include "CrashHandler.h"
 
 int main(int argc, char* argv[])
 {
+    CrashHandler::install();
     QApplication app(argc, argv);
     app.setApplicationName("Subtitle Editor");
     app.setFont(QFont("Segoe UI", 8));
