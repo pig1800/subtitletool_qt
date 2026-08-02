@@ -16,5 +16,5 @@ CMakeUserPresets.json
 *.sln
 *.vcxproj*
 
-# Claude Code session artifacts
+# Editor session artifacts
 .claude/
