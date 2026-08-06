@@ -1002,19 +1002,45 @@ void MainWindow::closeFile()
             m_ruleCheckDialog->hide();
     }
 
+    // Switch the view off the closing file's model BEFORE destroying the
+    // FileTab. FileTab owns a parentless SubtitleModel (a QObject); erasing
+    // first would destroy the model while the view still has it set — still
+    // connected, with mounted persistent editors referencing it — and crash
+    // in ~QObjectPrivate. setActiveFile runs setModel (disconnecting the old
+    // model + closing its editors), so the subsequent delete is clean.
+    FileTab* nextTab = nullptr;
+    if (m_files.size() > 1) {
+        int next = (idx + 1 < static_cast<int>(m_files.size())) ? idx + 1 : idx - 1;
+        nextTab = m_files[next].get();
+    }
+    setActiveFile(nextTab);
+
     m_files.erase(m_files.begin() + idx);
     refreshFileList();
 
-    if (!m_files.empty()) {
-        int next = std::min(idx, static_cast<int>(m_files.size()) - 1);
-        setActiveFile(m_files[next].get());
-    } else {
-        setActiveFile(nullptr);
+    // refreshFileList cleared the selection; re-select the now-active file.
+    // Guard against re-entering onFileListSelectionChanged (which would
+    // redundantly re-set the same active file).
+    if (m_activeFile) {
+        m_switchingFile = true;
+        for (int i = 0; i < static_cast<int>(m_files.size()); ++i) {
+            if (m_files[i].get() == m_activeFile) {
+                m_fileList->setCurrentRow(i);
+                break;
+            }
+        }
+        m_switchingFile = false;
     }
 }
 
 void MainWindow::closeAllFiles()
 {
+    // Switch the view off the active model before any FileTab is destroyed,
+    // so no model is torn down while the view still references it (see
+    // closeFile for why). Clean files are erased in a batch below; their
+    // models must not be the view's current model when that happens.
+    setActiveFile(nullptr);
+
     // Close clean files first
     m_files.erase(std::remove_if(m_files.begin(), m_files.end(),
         [](const auto& f) { return !f->dirty; }), m_files.end());
